@@ -1,73 +1,95 @@
-name: Build e Deploy no kind
+name: CI - Sonar e Push da imagem
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
-  IMAGE: nginx-aula-11:1.0.0
-  CLUSTER_NAME: aula-11
+  # Imagem no Docker Hub: docker.io/<usuario>/front-aula-12
+  IMAGE_NAME: docker.io/${{ secrets.DOCKER_USERNAME }}/front-aula-12
+  # Tag Ãºnica por commit
+  IMAGE: docker.io/${{ secrets.DOCKER_USERNAME }}/front-aula-12:${{ github.sha }}
 
 jobs:
+  sonar:
+    name: AnÃ¡lise SonarCloud
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: https://sonarcloud.io
+      SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+      SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+      SONAR_PROJECT_NAME: ${{ secrets.SONAR_PROJECT_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # histÃ³rico completo: blame e detecÃ§Ã£o de cÃ³digo novo
+
+      - name: Validar configuraÃ§Ã£o do Sonar
+        run: |
+          faltando=0
+          for nome in SONAR_TOKEN SONAR_ORGANIZATION SONAR_PROJECT_KEY SONAR_PROJECT_NAME; do
+            if [ -z "${!nome}" ]; then
+              echo "::error::$nome nÃ£o configurado (Settings > Secrets and variables > Actions)"
+              faltando=1
+            fi
+          done
+          exit $faltando
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v8
+        with:
+          projectBaseDir: front
+          args: >
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            "-Dsonar.projectName=${{ secrets.SONAR_PROJECT_NAME }}"
+
   build:
-    name: Build
-    runs-on: self-hosted
+    name: Build e Push
+    runs-on: ubuntu-latest
+    needs: sonar
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      # Em pull request a imagem sÃ³ Ã© construÃ­da, sem push
+      PUSH: ${{ github.event_name != 'pull_request' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build da imagem no Docker local
-        run: docker build -t "$IMAGE" app
-
-      # Sem registry: a imagem vai para o stage de deploy como artefato
-      - name: Exportar imagem
-        run: docker save "$IMAGE" -o imagem.tar
-
-      - name: Publicar artefato da imagem
-        uses: actions/upload-artifact@v4
-        with:
-          name: imagem
-          path: imagem.tar
-          retention-days: 1
-
-  deploy:
-    name: Deploy
-    runs-on: self-hosted
-    needs: build
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Instalar Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_wrapper: false
-
-      - name: Criar cluster kind com Terraform
-        working-directory: iac
+      - name: Validar credenciais do Docker Hub
         run: |
-          terraform init -input=false
-          terraform apply -input=false -auto-approve -var "cluster_name=$CLUSTER_NAME"
+          faltando=0
+          for nome in DOCKER_USERNAME DOCKER_PASSWORD; do
+            if [ -z "${!nome}" ]; then
+              echo "::error::Secret $nome nÃ£o configurado (Settings > Secrets and variables > Actions)"
+              faltando=1
+            fi
+          done
+          exit $faltando
 
-      - name: Configurar kubectl
-        run: kind export kubeconfig --name "$CLUSTER_NAME"
-
-      - name: Baixar artefato da imagem
-        uses: actions/download-artifact@v4
+      - name: Login no Docker Hub
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v4
         with:
-          name: imagem
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Carregar imagem no kind
+      - name: Build da imagem
+        run: docker build -t "$IMAGE" -t "$IMAGE_NAME:latest" front
+
+      - name: Push para o Docker Hub
+        if: env.PUSH == 'true'
         run: |
-          docker load -i imagem.tar
-          kind load docker-image "$IMAGE" --name "$CLUSTER_NAME"
-
-      - name: Aplicar manifestos
-        run: kubectl apply -f manifestos/
-
-      - name: Aguardar rollout
-        run: kubectl rollout status deployment/nginx-aula-11 --timeout=120s
-
-      - name: Testar aplicaÃ§Ã£o na porta 81
-        run: curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-all-errors http://localhost:81 | head -n 10
+          docker push "$IMAGE"
+          docker push "$IMAGE_NAME:latest"
+          {
+            echo "### Imagem publicada"
+            echo "- \`$IMAGE\`"
+            echo "- \`$IMAGE_NAME:latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
